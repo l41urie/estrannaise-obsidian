@@ -1,134 +1,181 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { Plugin } from 'obsidian';
 
-// Remember to rename these classes and interfaces!
+import {generatePlottingOptions, plotCurveOptions} from 'libestrannaise/plotting'
+import {modelList} from 'libestrannaise/models'
+import * as Plot from '@observablehq/plot';
 
-interface MyPluginSettings {
-	mySetting: string;
+interface EstrannaiseEntry {
+	date: Date;
+	mg: number;
+	model: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+function parseDateFlexible(dateStr: string): Date | null {
+	let parts: string[];
+	let y: number, m: number, d: number;
+	if (dateStr.includes('/')) {
+		// m/d/y
+		parts = dateStr.split('/').map(s => s.trim());
+		if (parts.length !== 3) return null;
+		[m, d, y] = parts.map(Number);
+	} else if (dateStr.includes('.')) {
+		// d.m.y
+		parts = dateStr.split('.').map(s => s.trim());
+		if (parts.length !== 3) return null;
+		[d, m, y] = parts.map(Number);
+	} else if (dateStr.includes('-')) {
+		// y-m-d
+		parts = dateStr.split('-').map(s => s.trim());
+		if (parts.length !== 3) return null;
+		[y, m, d] = parts.map(Number);
+	} else
+		return null;
+
+	if ([y, m, d].some(n => isNaN(n))) return null;
+	const date = new Date(y, m - 1, d);
+	return isNaN(date.getTime()) ? null : date;
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+function parseEstrannaiseCodeblock(codeblock: HTMLElement): EstrannaiseEntry[] | null {
+	const text = codeblock.innerText.trim();
+	const entries: EstrannaiseEntry[] = [];
 
+	for (const line of text.split("\n")) {
+		// eslint-disable-next-line prefer-const
+		let [dateStr, mgStr, model] = line.split("|").map(s => s.trim());
+		if (!dateStr || !mgStr || !model) return null;
+
+		const modelLower = model.toLowerCase();
+		const matchedModel = Object.entries(modelList).find(
+			([m, desc]) =>
+				m.toLowerCase().includes(modelLower) ||
+				(desc && desc.description && desc.description.toLowerCase().includes(modelLower))
+		);
+
+		if (!matchedModel) return null;
+		const [modelName] = matchedModel;
+		model = modelName;
+
+		const date = parseDateFlexible(dateStr);
+		const mg = parseFloat(mgStr);
+
+		if (!date || isNaN(date.getTime()) || isNaN(mg))
+			return null;
+
+		entries.push({ date, mg, model });
+	}
+
+	return entries;
+}
+
+interface EstrannaiseDataset {
+	customdoses: {
+		entries: {
+			dose: number;
+			time: number;
+			model: string;
+		}[];
+		curveVisible?: boolean;
+		uncertaintyVisible?: boolean;
+		daysAsIntervals?: boolean;
+	};
+	steadystates: {
+		entries: unknown[];
+	};
+}
+
+function buildEstrannaiseDataset(datapoints: EstrannaiseEntry[]): EstrannaiseDataset | null {
+	if (datapoints.length === 0) {
+		return null;
+	}
+
+	const baseDate = Date.now();
+	const entries = datapoints.map(entry => ({
+		dose: entry.mg,
+		time: (entry.date.getTime() - baseDate) / (1000 * 60 * 60 * 24),
+		model: entry.model
+	}));
+
+	return {
+		customdoses: {
+			entries,
+			curveVisible: true,
+			uncertaintyVisible: true,
+			daysAsIntervals: false
+		},
+		steadystates: { entries: [] }
+	};
+}
+
+function remap(v:number, l1:number, h1:number, l2:number, h2:number):number {
+    return l2 + (h2 - l2) * (v - l1) / (h1 - l1);
+}
+
+function appendPlotWithTitle(parent: HTMLElement, titleText: string, plot: HTMLElement) {
+	const title = document.createElement('div');
+	title.textContent = titleText;
+	title.style.fontWeight = "bold";
+	title.style.marginTop = "1em";
+	parent.appendChild(title);
+	parent.appendChild(plot);
+}
+
+export default class Estrannaise extends Plugin {
 	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		this.registerMarkdownPostProcessor((element) => {
+			const codeblocks = element.querySelectorAll('code.language-estrannaise');
+			codeblocks.forEach(codeblock => {
+				const entries = parseEstrannaiseCodeblock(codeblock as HTMLElement);
+				if(!entries)
+				{
+					(codeblock as HTMLElement).innerText = "Errornous input";
+					return;
 				}
-			}
+
+				const dataset = buildEstrannaiseDataset(entries);
+				if(dataset && dataset.customdoses.entries.length > 0)
+				{
+					// clear the text out, the graph represents it better.
+					(codeblock as HTMLElement).innerText = "";
+				}
+				else
+				{
+					(codeblock as HTMLElement).innerText = "Errornous input";
+					return;
+				}
+			
+				const options = generatePlottingOptions();
+				const plot_options = plotCurveOptions(dataset, options);
+
+				const dosage_highlights = Plot.ruleX(dataset.customdoses.entries.filter((el, i) => i != 0), { x: "time", stroke: "#f7a8B890", strokeWidth: 3, y1: 10, y2: 50 });
+				
+				// @ts-expect-error: yes, this is very much assignable
+				plot_options.marks = [dosage_highlights].concat(plot_options.marks);
+
+				appendPlotWithTitle(
+					codeblock.parentElement as HTMLElement,
+					`Overview (${dataset.customdoses.entries.length} doses)`,
+					Plot.plot(plot_options) as HTMLElement
+				);
+
+				// if we're focussing less than 30% of the plot on the last 50 days
+				// split up into two plots
+				const splitp = Math.max(plot_options.xMin, plot_options.xMax - 50);
+				if(remap(splitp, plot_options.xMin, plot_options.xMax, 0.0, 1.0) > 0.7)
+				{
+					// @ts-expect-error: capMin is either null or number
+					options.capMin = splitp;
+					const focussed_plot_options = plotCurveOptions(dataset, options);
+					// @ts-expect-error: yes, this is very much assignable
+					focussed_plot_options.marks = [dosage_highlights].concat(focussed_plot_options.marks);
+					
+					appendPlotWithTitle(
+						codeblock.parentElement as HTMLElement,
+						`Last ${Math.floor(plot_options.xMax - splitp)} Days (Zoomed In)`,
+						Plot.plot(focussed_plot_options) as HTMLElement
+					);
+				}
+			});
 		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
-
-	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
 	}
 }
