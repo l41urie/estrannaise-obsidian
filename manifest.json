@@ -1,9 +1,9 @@
 {
 	"id": "estrannaise",
 	"name": "Estrannaise",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "0.15.0",
-	"description": "Integrates the Estrannaise E2 pharmacokinetics playground into obsidian",
+	"description": "Integrates the Estrannaise E2 pharmacokinetics playground",
 	"author": "Laurie",
 	"authorUrl": "https://github.com/l41urie",
 	"isDesktopOnly": false
