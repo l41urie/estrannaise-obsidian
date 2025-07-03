@@ -114,8 +114,7 @@ function remap(v:number, l1:number, h1:number, l2:number, h2:number):number {
 function appendPlotWithTitle(parent: HTMLElement, titleText: string, plot: HTMLElement) {
 	const title = document.createElement('div');
 	title.textContent = titleText;
-	title.style.fontWeight = "bold";
-	title.style.marginTop = "1em";
+	title.classList.add('estrannaise-plot-title');
 	parent.appendChild(title);
 	parent.appendChild(plot);
 }
